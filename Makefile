@@ -39,6 +39,7 @@ AUTH_STACK ?= $(PROJECT_NAME)-auth
 APP_STACK ?= $(PROJECT_NAME)-backend
 ECR_STACK ?= $(PROJECT_NAME)-ecr
 FRONTEND_STACK ?= $(PROJECT_NAME)-frontend
+REPORTS_STACK ?= $(PROJECT_NAME)-reports
 IMAGE_TAG ?= latest
 # x86_64 or arm64. arm64 is ~20% cheaper on Lambda and builds natively on
 # Apple Silicon; the image platform is derived from it so the two cannot drift.
@@ -94,7 +95,7 @@ endef
 
 .PHONY: help up up-build down down-v logs ps migrate revision seed test lint fmt shell-backend psql \
         aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
-        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy
+        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-deploy-reports report-now aws-reports-logs aws-destroy
 
 help:
 	@grep -hE '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -348,11 +349,81 @@ aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against th
 aws-frontend-url: ## Print the deployed site URL
 	@$(call stack-output,$(FRONTEND_STACK),SiteUrl)
 
+aws-deploy-reports: ## Deploy Lab 5 event-driven reports stack (S3, SQS, EventBridge, Lambda builder & mailer)
+	$(require-aws-credentials)
+	@test -n "$(REPORTS_FROM_EMAIL)" || { echo "REPORTS_FROM_EMAIL is empty — set it in .env or as argument (e.g. REPORTS_FROM_EMAIL=your@email.com)"; exit 1; }; \
+	test -n "$(REPORTS_TO_EMAIL)" || { echo "REPORTS_TO_EMAIL is empty — set it in .env or as argument (e.g. REPORTS_TO_EMAIL=your@email.com)"; exit 1; }; \
+	db_endpoint=$$($(call stack-output,$(APP_STACK),DatabaseEndpoint) 2>/dev/null | tr -d '[:space:]'); \
+	sg=$$($(call stack-output,$(APP_STACK),FunctionSecurityGroupId) 2>/dev/null | tr -d '[:space:]'); \
+	case "$$db_endpoint" in ""|None) echo "No backend stack found — run make aws-deploy-backend first"; exit 1 ;; esac; \
+	vpc=$$($(AWS) ec2 describe-vpcs --filters Name=isDefault,Values=true \
+		--query 'Vpcs[0].VpcId' --output text | tr -d '[:space:]'); \
+	subnets=$$($(AWS) ec2 describe-subnets \
+		--filters Name=vpc-id,Values=$$vpc Name=default-for-az,Values=true \
+		--query 'Subnets[].SubnetId' --output text | tr '[:space:]' ',' | sed 's/,*$$//'); \
+	route_tables=$$($(AWS) ec2 describe-route-tables \
+		--filters Name=vpc-id,Values=$$vpc \
+		--query 'RouteTables[].RouteTableId' --output text | tr '[:space:]' ',' | sed 's/,*$$//'); \
+	repo=$$($(call stack-output,$(ECR_STACK),RepositoryUri) | tr -d '[:space:]'); \
+	digest=$$($(AWS) ecr describe-images --repository-name "$${repo#*/}" \
+		--image-ids imageTag=$(IMAGE_TAG) --query 'imageDetails[0].imageDigest' \
+		--output text | tr -d '[:space:]'); \
+	db_url="postgresql+asyncpg://app:$(AWS_DB_PASSWORD)@$$db_endpoint:5432/meetings"; \
+	echo "Deploying reports stack with vpc=$$vpc, s3 gateway endpoint on $$route_tables"; \
+	$(call wait-stack-idle,$(REPORTS_STACK)); \
+	$(call clear-failed-create,$(REPORTS_STACK)); \
+	$(AWS) cloudformation deploy \
+		--stack-name $(REPORTS_STACK) \
+		--template-file infra/reports.yml \
+		--capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+		--no-fail-on-empty-changeset \
+		$(STACK_TAGS) \
+		--parameter-overrides \
+			"ProjectName=$(PROJECT_NAME)" \
+			"VpcId=$$vpc" \
+			"SubnetIds=$$subnets" \
+			"RouteTableIds=$$route_tables" \
+			"SecurityGroupIds=$$sg" \
+			"ImageUri=$$repo@$$digest" \
+			"Architecture=$(AWS_LAMBDA_ARCH)" \
+			"DatabaseUrl=$$db_url" \
+			"AppTimezone=$(APP_TIMEZONE)" \
+			"SenderEmail=$(REPORTS_FROM_EMAIL)" \
+			"RecipientEmail=$(REPORTS_TO_EMAIL)"
+
+report-now: ## Generate a report on demand via SQS (e.g. make report-now WEEK=2026-W40)
+	$(require-aws-credentials)
+	@queue_url=$$($(call stack-output,$(REPORTS_STACK),ReportRequestsQueueUrl) | tr -d '[:space:]'); \
+	test -n "$$queue_url" -a "$$queue_url" != "None" || { echo "No reports queue found — run make aws-deploy-reports first"; exit 1; }; \
+	target_week="$(WEEK)"; \
+	case "$$target_week" in \
+		"") body='{"week": null, "source": "sqs"}' ;; \
+		*) body="{\"week\": \"$$target_week\", \"source\": \"sqs\"}" ;; \
+	esac; \
+	echo "Sending on-demand report request to $$queue_url: $$body"; \
+	$(AWS) sqs send-message --queue-url "$$queue_url" --message-body "$$body"
+
+aws-reports-logs: ## Show CloudWatch logs for builder and mailer Lambdas
+	$(require-aws-credentials)
+	@echo "--- Builder Logs ($(PROJECT_NAME)-report-builder) ---"; \
+	$(AWS) logs filter-log-events --log-group-name "/aws/lambda/$(PROJECT_NAME)-report-builder" \
+		--limit 20 --query 'events[].message' --output text || true; \
+	echo "--- Mailer Logs ($(PROJECT_NAME)-report-mailer) ---"; \
+	$(AWS) logs filter-log-events --log-group-name "/aws/lambda/$(PROJECT_NAME)-report-mailer" \
+		--limit 20 --query 'events[].message' --output text || true
+
 aws-destroy: ## Delete every stack, including the database and its data
 	$(require-aws-credentials)
-	@printf 'Delete %s, %s, %s and %s? The Aurora cluster and all its data, and every user account, go with them (no snapshot). Type yes: ' \
-		"$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
+	@printf 'Delete %s, %s, %s, %s and %s? The Aurora cluster and all its data, and every user account, go with them (no snapshot). Type yes: ' \
+		"$(REPORTS_STACK)" "$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
 		read answer; test "$$answer" = "yes" || { echo "Aborted."; exit 1; }
+	@rep_bucket=$$($(call stack-output,$(REPORTS_STACK),ReportsBucketName) 2>/dev/null | tr -d '[:space:]'); \
+		if [ -n "$$rep_bucket" ] && [ "$$rep_bucket" != "None" ]; then \
+			echo "Emptying s3://$$rep_bucket"; \
+			$(AWS) s3 rm "s3://$$rep_bucket" --recursive --only-show-errors || true; \
+		fi
+	-$(AWS) cloudformation delete-stack --stack-name $(REPORTS_STACK)
+	-$(AWS) cloudformation wait stack-delete-complete --stack-name $(REPORTS_STACK)
 	@bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) 2>/dev/null | tr -d '[:space:]'); \
 		if [ -n "$$bucket" ] && [ "$$bucket" != "None" ]; then \
 			echo "Emptying s3://$$bucket"; \

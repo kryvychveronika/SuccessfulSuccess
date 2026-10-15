@@ -15,3 +15,5 @@ next-env.d.ts
 .env*.local
 .idea/
 .DS_Store
+.chrome-temp/
+_lab2_local_backup/

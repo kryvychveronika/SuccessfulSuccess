@@ -342,3 +342,6 @@ Outputs:
     Value: !Ref ApiFunction
   LogGroupName:
     Value: !Ref LogGroup
+  FunctionSecurityGroupId:
+    Description: Security group attached to functions talking to the database
+    Value: !Ref FunctionSecurityGroup
